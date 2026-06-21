@@ -1,8 +1,9 @@
-"""Discord bot that bans accounts for spamming"""
+"""Discord bot that mutes, then bans, accounts for spamming"""
 
 import os
 import time
 import logging
+import datetime
 from collections import defaultdict, deque
 
 import discord
@@ -45,8 +46,17 @@ SPAM_WINDOW_SECONDS = _env_int("SPAM_WINDOW_SECONDS", 10)
 # Override with the SPAM_MESSAGE_THRESHOLD environment variable.
 SPAM_MESSAGE_THRESHOLD = _env_int("SPAM_MESSAGE_THRESHOLD", 4)
 
-# Period of messages to delete on ban (seconds). 1 day = 86400 seconds.
-BAN_DELETE_MESSAGE_SECONDS = _env_int("BAN_DELETE_MESSAGE_SECONDS", 10 * 60)
+# How long to mute (timeout) a user on their first violation (seconds).
+# Override with the MUTE_DURATION_SECONDS environment variable.
+MUTE_DURATION_SECONDS = _env_int("MUTE_DURATION_SECONDS", 10 * 60)
+
+# Re-offense window (seconds). A user who triggers spam detection again within
+# this period after being muted is banned instead of muted again.
+# Override with the REOFFENSE_WINDOW_SECONDS environment variable.
+REOFFENSE_WINDOW_SECONDS = _env_int("REOFFENSE_WINDOW_SECONDS", 60 * 60)
+
+# Period of messages to delete on ban (seconds). Defaults to the past hour.
+BAN_DELETE_MESSAGE_SECONDS = _env_int("BAN_DELETE_MESSAGE_SECONDS", 60 * 60)
 
 # --- Bot --------------------------------------------------------------------
 
@@ -59,6 +69,17 @@ client = discord.Client(intents=intents)
 # Recent post timestamps per (guild_id, user_id).
 # A deque is used so out-of-window timestamps can be dropped as we go.
 message_history: dict[tuple[int, int], deque[float]] = defaultdict(deque)
+
+# Timestamp (epoch seconds) of the most recent mute per (guild_id, user_id).
+# Used to escalate to a ban when a user re-offends within the re-offense window.
+muted_at: dict[tuple[int, int], float] = {}
+
+# Message shown to a muted user. The exact threshold is intentionally withheld.
+MUTE_DM_MESSAGE = (
+    "You have been temporarily muted in **{guild}** for sending messages too "
+    "quickly. The mute lasts about {minutes} minutes. Please slow down — if it "
+    "happens again shortly after, you may be banned from the server."
+)
 
 
 async def notify_system_channel(guild: discord.Guild, message: str) -> None:
@@ -105,6 +126,19 @@ async def cleanup_message_history() -> None:
     if stale_keys:
         logger.info("Cleaned up message_history: removed %d entries", len(stale_keys))
 
+    # Drop mute records that are past the re-offense window; they can no longer
+    # escalate to a ban, so there is no reason to keep them.
+    expired_mutes = [
+        key
+        for key, ts in muted_at.items()
+        if now - ts > REOFFENSE_WINDOW_SECONDS
+    ]
+    for key in expired_mutes:
+        del muted_at[key]
+
+    if expired_mutes:
+        logger.info("Cleaned up muted_at: removed %d entries", len(expired_mutes))
+
 
 @client.event
 async def on_ready() -> None:
@@ -143,27 +177,84 @@ async def on_message(message: discord.Message) -> None:
         author, guild.name, SPAM_MESSAGE_THRESHOLD, SPAM_WINDOW_SECONDS,
     )
 
+    # Escalate to a ban if the user re-offends within the re-offense window
+    # after being muted; otherwise mute them for MUTE_DURATION_SECONDS.
+    previous_mute = muted_at.get(key)
+    if previous_mute is not None and now - previous_mute <= REOFFENSE_WINDOW_SECONDS:
+        await ban_user(guild, author)
+    else:
+        await mute_user(guild, author, key)
+
+
+async def mute_user(
+    guild: discord.Guild,
+    member: discord.Member,
+    key: tuple[int, int],
+) -> None:
+    """Time the member out, notify the system channel, and DM them.
+
+    The DM is sent in English and deliberately does not reveal the exact
+    spam threshold. The mute is recorded so a re-offense escalates to a ban.
+    """
     try:
-        await guild.ban(
-            author,
+        await member.timeout(
+            datetime.timedelta(seconds=MUTE_DURATION_SECONDS),
             reason="Spam detected",
-            delete_message_seconds=BAN_DELETE_MESSAGE_SECONDS,
         )
     except discord.Forbidden:
-        logger.warning("No permission to ban: user=%s", author)
+        logger.warning("No permission to mute: user=%s", member)
         await notify_system_channel(
             guild,
-            f"⚠️ Detected spam from {author.mention}, but I lack permission to ban.",
+            f"⚠️ Detected spam from {member.mention}, but I lack permission to mute.",
         )
         return
     except discord.DiscordException:
-        logger.exception("Failed to ban: user=%s", author)
+        logger.exception("Failed to mute: user=%s", member)
         return
+
+    # Record the mute so a quick re-offense escalates to a ban.
+    muted_at[key] = time.time()
+
+    minutes = MUTE_DURATION_SECONDS // 60
+    await notify_system_channel(
+        guild,
+        f"🔇 Muted {member} ({member.mention}) for {minutes} minutes for spamming.",
+    )
+
+    # DM the user. They may have DMs disabled, so failures are non-fatal.
+    try:
+        await member.send(MUTE_DM_MESSAGE.format(guild=guild.name, minutes=minutes))
+    except discord.Forbidden:
+        logger.info("Could not DM muted user (DMs closed?): user=%s", member)
+    except discord.DiscordException:
+        logger.exception("Failed to DM muted user: user=%s", member)
+
+
+async def ban_user(guild: discord.Guild, member: discord.Member) -> None:
+    """Ban a re-offending member, deleting their recent messages."""
+    try:
+        await guild.ban(
+            member,
+            reason="Repeated spam after mute",
+            delete_message_seconds=BAN_DELETE_MESSAGE_SECONDS,
+        )
+    except discord.Forbidden:
+        logger.warning("No permission to ban: user=%s", member)
+        await notify_system_channel(
+            guild,
+            f"⚠️ Detected repeated spam from {member.mention}, but I lack permission to ban.",
+        )
+        return
+    except discord.DiscordException:
+        logger.exception("Failed to ban: user=%s", member)
+        return
+
+    # The user is gone; drop any mute record so it cannot linger.
+    muted_at.pop((guild.id, member.id), None)
 
     await notify_system_channel(
         guild,
-        f"🔨 Banned {author} ({author.mention}) for spamming "
-        f"({SPAM_MESSAGE_THRESHOLD}+ messages in {SPAM_WINDOW_SECONDS}s); "
+        f"🔨 Banned {member} ({member.mention}) for repeated spamming after a mute.",
     )
 
 
