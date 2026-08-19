@@ -58,6 +58,10 @@ REOFFENSE_WINDOW_SECONDS = _env_int("REOFFENSE_WINDOW_SECONDS", 60 * 60)
 # Period of messages to delete on ban (seconds). Defaults to the past hour.
 BAN_DELETE_MESSAGE_SECONDS = _env_int("BAN_DELETE_MESSAGE_SECONDS", 60 * 60)
 
+# Period of messages to delete when banning a media-only first post (seconds).
+# 7 days is the maximum Discord allows for delete_message_seconds.
+FIRST_POST_BAN_DELETE_SECONDS = 7 * 24 * 60 * 60
+
 # --- Bot --------------------------------------------------------------------
 
 intents = discord.Intents.default()
@@ -74,12 +78,81 @@ message_history: dict[tuple[int, int], deque[float]] = defaultdict(deque)
 # Used to escalate to a ban when a user re-offends within the re-offense window.
 muted_at: dict[tuple[int, int], float] = {}
 
+# (guild_id, user_id) pairs confirmed to have posted before. Members in this
+# set skip the media-only first-post check entirely.
+known_posters: set[tuple[int, int]] = set()
+
 # Message shown to a muted user. The exact threshold is intentionally withheld.
 MUTE_DM_MESSAGE = (
     "You have been temporarily muted in **{guild}** for sending messages too "
     "quickly. The mute lasts about {minutes} minutes. Please slow down — if it "
     "happens again shortly after, you may be banned from the server."
 )
+
+
+def is_media_only(message: discord.Message) -> bool:
+    """Return True if the message has no text and only image/video attachments.
+
+    Sticker-only messages are not media-only: they have no attachments.
+    Attachments whose content_type is unknown (None) or of any other kind
+    (e.g. application/pdf) are given the benefit of the doubt.
+    """
+    if message.content.strip():
+        return False
+    if not message.attachments:
+        return False
+    return all(
+        attachment.content_type is not None
+        and attachment.content_type.startswith(("image/", "video/"))
+        for attachment in message.attachments
+    )
+
+
+async def has_prior_message(guild: discord.Guild, message: discord.Message) -> bool | None:
+    """Check whether the author has an earlier message indexed in the guild.
+
+    Uses GET /guilds/{guild_id}/messages/search, which discord.py has no
+    wrapper for. Asks for the 2 newest messages so the answer does not depend
+    on whether the triggering message itself is already in the search index:
+    any hit with a different id proves an earlier post exists.
+
+    Returns True if an earlier post exists, False if this is the author's
+    first post, or None if the search failed or returned an unexpected shape
+    (e.g. the index is still being built) — callers should skip the check.
+    """
+    route = discord.http.Route(
+        "GET", "/guilds/{guild_id}/messages/search", guild_id=guild.id
+    )
+    params = {
+        "author_id": message.author.id,
+        "sort_by": "timestamp",
+        "sort_order": "desc",
+        "limit": 2,
+    }
+    try:
+        data = await client.http.request(route, params=params)
+    except discord.HTTPException:
+        logger.exception(
+            "Message search failed: guild=%s user=%s", guild.name, message.author
+        )
+        return None
+
+    # A 202 "index not ready" response has no "messages" key; treat anything
+    # without one as inconclusive rather than as "no prior posts".
+    if not isinstance(data, dict) or "messages" not in data:
+        logger.warning("Inconclusive message search response: %r", data)
+        return None
+
+    try:
+        for entry in data["messages"]:
+            # Each entry is a list of messages with the hit first.
+            hit = entry[0] if isinstance(entry, list) else entry
+            if int(hit["id"]) != message.id:
+                return True
+        return False
+    except (KeyError, TypeError, ValueError, IndexError):
+        logger.warning("Unexpected message search response shape: %r", data)
+        return None
 
 
 async def notify_system_channel(guild: discord.Guild, message: str) -> None:
@@ -158,6 +231,38 @@ async def on_message(message: discord.Message) -> None:
     author = message.author
     key = (guild.id, author.id)
 
+    # Ban accounts whose very first post in the guild is media-only.
+    if key not in known_posters:
+        if message_history[key]:
+            # The spam tracker has already seen this user post, so this
+            # cannot be their first message; no need to search.
+            known_posters.add(key)
+        elif is_media_only(message):
+            prior = await has_prior_message(guild, message)
+            if prior is False:
+                logger.info(
+                    "Media-only first post detected: user=%s guild=%s",
+                    author, guild.name,
+                )
+                await ban_user(
+                    guild,
+                    author,
+                    reason="Media-only first post",
+                    delete_message_seconds=FIRST_POST_BAN_DELETE_SECONDS,
+                    notice=(
+                        f"🔨 Banned {author} ({author.mention}) for posting only "
+                        "media as their first message."
+                    ),
+                )
+                return
+            if prior is True:
+                known_posters.add(key)
+            # prior is None: the search was inconclusive; leave the user
+            # unchecked so the next message tries again.
+        else:
+            # A regular post is now on record; skip future first-post checks.
+            known_posters.add(key)
+
     now = message.created_at.timestamp()
     history = message_history[key]
     history.append(now)
@@ -230,19 +335,25 @@ async def mute_user(
         logger.exception("Failed to DM muted user: user=%s", member)
 
 
-async def ban_user(guild: discord.Guild, member: discord.Member) -> None:
-    """Ban a re-offending member, deleting their recent messages."""
+async def ban_user(
+    guild: discord.Guild,
+    member: discord.Member,
+    reason: str = "Repeated spam after mute",
+    delete_message_seconds: int = BAN_DELETE_MESSAGE_SECONDS,
+    notice: str | None = None,
+) -> None:
+    """Ban a member, deleting their recent messages."""
     try:
         await guild.ban(
             member,
-            reason="Repeated spam after mute",
-            delete_message_seconds=BAN_DELETE_MESSAGE_SECONDS,
+            reason=reason,
+            delete_message_seconds=delete_message_seconds,
         )
     except discord.Forbidden:
         logger.warning("No permission to ban: user=%s", member)
         await notify_system_channel(
             guild,
-            f"⚠️ Detected repeated spam from {member.mention}, but I lack permission to ban.",
+            f"⚠️ Tried to ban {member.mention} ({reason}), but I lack permission to ban.",
         )
         return
     except discord.DiscordException:
@@ -252,10 +363,9 @@ async def ban_user(guild: discord.Guild, member: discord.Member) -> None:
     # The user is gone; drop any mute record so it cannot linger.
     muted_at.pop((guild.id, member.id), None)
 
-    await notify_system_channel(
-        guild,
-        f"🔨 Banned {member} ({member.mention}) for repeated spamming after a mute.",
-    )
+    if notice is None:
+        notice = f"🔨 Banned {member} ({member.mention}) for repeated spamming after a mute."
+    await notify_system_channel(guild, notice)
 
 
 def main() -> None:
