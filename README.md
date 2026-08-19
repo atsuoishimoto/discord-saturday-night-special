@@ -11,6 +11,20 @@ window) and escalates moderation in two steps:
    again within an hour of being muted, it is banned and its messages from the
    past hour are deleted. The system channel is notified.
 
+It also bans accounts whose **very first post** in the server is media-only:
+
+- A message counts as media-only when it has no text and every attachment is
+  an image (`image/*`) or a video (`video/*`). Sticker-only messages and
+  attachments of other or unknown types are allowed.
+- Whether it is the author's first post is checked with the guild message
+  search endpoint (`GET /guilds/{guild_id}/messages/search`), asking for the
+  author's two newest messages; any hit other than the triggering message
+  proves an earlier post exists. If the search fails or the index is not
+  ready, the check is skipped rather than risking a false ban.
+- On a hit, the account is banned and its messages from the past 7 days (the
+  Discord maximum) are deleted. Users confirmed to have posted before are
+  remembered in memory so they are never re-checked.
+
 
 | Environment variable | Default | Description |
 | --- | --- | --- |
