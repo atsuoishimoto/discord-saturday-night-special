@@ -233,7 +233,11 @@ async def on_message(message: discord.Message) -> None:
 
     # Ban accounts whose very first post in the guild is media-only.
     if key not in known_posters:
-        if is_media_only(message):
+        if message_history[key]:
+            # The spam tracker has already seen this user post, so this
+            # cannot be their first message; no need to search.
+            known_posters.add(key)
+        elif is_media_only(message):
             prior = await has_prior_message(guild, message)
             if prior is False:
                 logger.info(
